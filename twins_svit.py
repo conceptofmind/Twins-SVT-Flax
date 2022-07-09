@@ -4,27 +4,9 @@ import jax
 import jax.numpy as jnp
 from jax.numpy import einsum
 
-import numpy as np
-
 from typing import Callable
 
-from einops import rearrange, repeat
-
 from einops import rearrange
-
-def group_dict_by_key(cond, d):
-    return_val = [dict(), dict()]
-    for key in d.keys():
-        match = bool(cond(key))
-        ind = int(not match)
-        return_val[ind][key] = d[key]
-    return (*return_val,)
-
-def group_by_key_prefix_and_remove_prefix(prefix, d):
-    kwargs_with_prefix, kwargs = group_dict_by_key(lambda x: x.startswith(prefix), d)
-    kwargs_without_prefix = dict(map(lambda x: (x[0][len(prefix):], x[1]), tuple(kwargs_with_prefix.items())))
-    return kwargs_without_prefix, kwargs
-
 
 class IdentityLayer(nn.Module):
 
@@ -64,6 +46,12 @@ class LayerNorm(nn.Module): # layernorm, but done in the channel dimension #1
 
         return x
 
+class GlobalAvgPool(nn.Module):
+
+    @nn.compact
+    def __call__(self, x):
+        return jnp.mean(x, axis = (1, 2))
+
 class MLP(nn.Module):
     dim: int 
     mult: int = 4 
@@ -73,9 +61,9 @@ class MLP(nn.Module):
     def __call__(self, x):
         x = nn.Conv(features = self.dim * self.mult, kernel_size = (1, 1), strides = (1, 1))(x)
         x = nn.gelu(x)
-        x = nn.Dropout(rate = self.dropout)(x)
+        x = nn.Dropout(rate = self.dropout)(x, deterministic = False)
         x = nn.Conv(features = self.dim, kernel_size = (1, 1), strides = (1, 1))(x)
-        x = nn.Dropout(rate = self.dropout)(x)
+        x = nn.Dropout(rate = self.dropout)(x, deterministic = False)
         return x
 
 class PatchEmbedding(nn.Module):
@@ -84,15 +72,8 @@ class PatchEmbedding(nn.Module):
 
     @nn.compact
     def __call__(self, fmap):
-
-        dim_out = self.dim_out
-        patch_size = self.patch_size
-        proj = nn.Conv(features = dim_out, kernel_size = (1, 1), strides = (1, 1))
-
-        p = patch_size
-        fmap = rearrange(fmap, 'b (h p1) (w p2) c -> b h w (c p1 p2)', p1 = p, p2 = p)
-        x = proj(fmap)
-
+        fmap = rearrange(fmap, 'b (h p1) (w p2) c -> b h w (c p1 p2)', p1 = self.patch_size, p2 = self.patch_size)
+        x = nn.Conv(features = self.dim_out, kernel_size = (1, 1), strides = (1, 1))(fmap)
         return x
 
 class PEG(nn.Module):
@@ -102,7 +83,7 @@ class PEG(nn.Module):
     @nn.compact
     def __call__(self, x):
         proj = Residual(nn.Conv(features = self.dim, 
-                                kernel_size = (self.kernel_size, self.kernal_size), 
+                                kernel_size = (self.kernel_size, self.kernel_size), 
                                 strides = (1, 1), 
                                 padding = 'SAME', 
                                 feature_group_count = self.dim))
@@ -121,7 +102,6 @@ class LocalAttention(nn.Module):
 
         inner_dim = self.dim_head * self.heads
         patch_size = self.patch_size
-        heads = self.heads
         scale = self.dim_head ** -0.5
 
         to_q = nn.Conv(features = inner_dim, kernel_size = (1, 1), strides = (1, 1), use_bias=False)
@@ -129,11 +109,11 @@ class LocalAttention(nn.Module):
 
         to_out = nn.Sequential([
             nn.Conv(features = self.dim, kernel_size = (1, 1), strides = (1, 1)),
-            nn.Dropout(rate = self.dropout)
+            nn.Dropout(rate = self.dropout, deterministic = False)
         ])
 
         b, x, y, n = fmap.shape
-        h = heads
+        h = self.heads
         p = patch_size
         x, y = map(lambda t: t // p, (x, y))
 
@@ -169,11 +149,11 @@ class GlobalAttention(nn.Module):
         scale = self.dim_head ** -0.5
 
         to_q = nn.Conv(features = inner_dim, kernel_size = (1, 1), use_bias = False)
-        to_kv = nn.Conv(features = inner_dim * 2, kernel_size = (k, k), strides = (k, k), use_bias = False)
+        to_kv = nn.Conv(features = inner_dim * 2, kernel_size = (self.k, self.k), strides = (self.k, self.k), use_bias = False)
 
         to_out = nn.Sequential([
             nn.Conv(features = self.dim, kernel_size = (1, 1), strides = (1, 1)),
-            nn.Dropout(rate = self.dropout)
+            nn.Dropout(rate = self.dropout, deterministic = False)
         ])
 
         b, _, y, n = x.shape
@@ -189,6 +169,7 @@ class GlobalAttention(nn.Module):
         attn = nn.softmax(dots, axis = -1)
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) (x y) d -> b x y (h d)', h = h, y = y)
+
         out = to_out(out)
         return out
 
@@ -210,10 +191,10 @@ class Transformer(nn.Module):
 
         for _ in range(self.depth):
             layers.append([
-                Residual(PreNorm(self.dim, LocalAttention(self.dim, self.heads, self.dim_head, dropout = self.dropout, patch_size = self.local_patch_size))) if self.has_local else IdentityLayer(),
-                Residual(PreNorm(self.dim, MLP(self.dim, self.mlp_mult, dropout = self.dropout))) if self.has_local else IdentityLayer(),
-                Residual(PreNorm(self.dim, GlobalAttention(self.dim, heads = self.heads, dim_head = self.dim_head, dropout = self.dropout, k = self.global_k))),
-                Residual(PreNorm(self.dim, MLP(self.dim, self.mlp_mult, dropout = self.dropout)))
+                Residual(PreNorm(LocalAttention(self.dim, self.heads, self.dim_head, dropout = self.dropout, patch_size = self.local_patch_size))) if self.has_local else IdentityLayer(),
+                Residual(PreNorm(MLP(self.dim, self.mlp_mult, dropout = self.dropout))) if self.has_local else IdentityLayer(),
+                Residual(PreNorm(GlobalAttention(self.dim, heads = self.heads, dim_head = self.dim_head, dropout = self.dropout, k = self.global_k))),
+                Residual(PreNorm(MLP(self.dim, self.mlp_mult, dropout = self.dropout)))
             ])
 
         for local_attn, ff1, global_attn, ff2 in layers:
@@ -250,33 +231,92 @@ class TwinsSVT(nn.Module):
     dropout: float = 0.0
 
     @nn.compact
-    def __call__(self, x, **kwargs):
+    def __call__(self, x):
 
-        kwargs = dict(locals())
+        x = PatchEmbedding(dim_out = self.s1_emb_dim, patch_size = self.s1_patch_size)(x)
 
-        layers = nn.Sequential([])
+        x = Transformer(dim = self.s1_emb_dim, 
+                        depth = self.s1_depth, 
+                        local_patch_size=self.s1_local_patch_size,
+                        global_k = self.s1_global_k, 
+                        dropout = self.dropout, 
+                        has_local = True)(x)
 
-        for prefix in ('s1', 's2', 's3', 's4'):
-            config, kwargs = group_by_key_prefix_and_remove_prefix(f'{prefix}_', kwargs)
-            is_last = prefix == 's4'
-            print(config)
-            dim_next = config['emb_dim']
+        x = PEG(dim = self.s1_emb_dim, kernel_size = self.peg_kernel_size)(x)
 
-            layers.append(nn.Sequential([
-                PatchEmbedding(dim_out=dim_next, patch_size=config['patch_size']),
-                Transformer(dim=dim_next, depth=1, local_patch_size=config['local_patch_size'],
-                            global_k=config['global_k'], dropout = self.dropout, has_local=not is_last),
-                PEG(dim=dim_next, kernel_size = self.peg_kernel_size),
-                Transformer(dim=dim_next, depth=config['depth'], local_patch_size=config['local_patch_size'],
-                            global_k=config['global_k'], dropout = self.dropout, has_local=not is_last)
-            ]))
+        x = Transformer(
+                dim = self.s1_emb_dim, 
+                depth =self.s1_depth, 
+                local_patch_size = self.s1_local_patch_size,
+                global_k = self.s1_global_k, 
+                dropout = self.dropout, 
+                has_local = True)(x)
+        
+        #s2
+        x = PatchEmbedding(dim_out = self.s2_emb_dim, patch_size = self.s2_patch_size)(x)
 
-        layers += nn.Sequential([
-            nn.avg_pool(),
-            nn.Dense(features = self.num_classes)
-        ])
+        x = Transformer(
+                dim = self.s2_emb_dim,
+                depth = self.s2_depth,
+                local_patch_size = self.s2_local_patch_size,
+                global_k = self.s2_global_k,
+                dropout = self.dropout,
+                has_local = True)(x)
 
-        x = svt_layers(x)
+        x = PEG(dim = self.s2_emb_dim, kernel_size = self.peg_kernel_size)(x)
+
+        x = Transformer(
+                dim = self.s2_emb_dim,
+                depth = self.s2_depth,
+                local_patch_size = self.s2_local_patch_size,
+                global_k = self.s2_global_k,
+                dropout = self.dropout,
+                has_local = True)(x)
+        #s3
+        x = PatchEmbedding(dim_out = self.s3_emb_dim, patch_size = self.s3_patch_size)(x)
+
+        x = Transformer(
+                dim = self.s3_emb_dim,
+                depth = self.s3_depth,
+                local_patch_size = self.s3_local_patch_size,
+                global_k = self.s3_global_k,
+                dropout = self.dropout,
+                has_local = True)(x)
+
+        x = PEG(dim = self.s3_emb_dim, kernel_size = self.peg_kernel_size)(x)
+
+        x = Transformer(
+                dim = self.s3_emb_dim,
+                depth = self.s3_depth,
+                local_patch_size = self.s3_local_patch_size,
+                global_k = self.s3_global_k,
+                dropout = self.dropout,
+                has_local = True)(x)
+        
+        #s4
+        x = PatchEmbedding(dim_out = self.s4_emb_dim, patch_size = self.s4_patch_size)(x)
+
+        x = Transformer(
+                dim = self.s4_emb_dim,
+                depth = self.s4_depth,
+                local_patch_size = self.s4_local_patch_size,
+                global_k = self.s4_global_k,
+                dropout = self.dropout,
+                has_local = False)(x)
+
+        x = PEG(dim = self.s4_emb_dim, kernel_size = self.peg_kernel_size)(x)
+
+        x = Transformer(
+                dim = self.s4_emb_dim,
+                depth = self.s4_depth,
+                local_patch_size = self.s4_local_patch_size,
+                global_k = self.s4_global_k,
+                dropout = self.dropout,
+                has_local = False)(x)
+
+        x = GlobalAvgPool()(x) 
+        x = nn.Dense(features = self.num_classes)(x)
+
         return x
 
 if __name__ == "__main__":
